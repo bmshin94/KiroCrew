@@ -42,10 +42,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro_crew.acp import client as client_mod
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.harness import SpawnContext
+from kiro_crew.acp.harness import codex as codex_harness_mod
+from kiro_crew.acp.harness import harness_for
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
 )
 from kiro_crew.config import paths as config_paths
@@ -369,12 +374,67 @@ def _reset_bin_caches() -> None:
     client_mod._self_served_bin_caches.clear()
 
 
-def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
-    """Drive ``_spawn`` for *backend* and return its four launch answers.
+#: Hosts launched ONLY by ``AcpRuntime``. The kiro family is on the runtime too but
+#: keeps a client arm for the per-session path, so it is captured through ``_spawn``
+#: like every other harness; a runtime-only host has no client arm to drive, and its
+#: launch is the plan its harness resolves at Seam 1.
+RUNTIME_ONLY_BACKENDS = frozenset(ACP_BACKENDS_ACP_RUNTIME - ACP_BACKENDS_KIRO_SLASH_COMMANDS)
 
+
+def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> dict[str, Any]:
+    """The launch of a runtime-only host: its harness's spawn plan and env edit.
+
+    The same four questions the client capture answers, from the seam that answers
+    them for this host. The two labels are the runtime's, not per-harness, so the
+    entry names its server instead; ``env_added`` is what ``apply_spawn_env``
+    contributes, and ``env_removed`` what it strips -- a foreign adapter must never
+    receive kiro-cli's credential, and that removal is the positive fact pinned here.
+    """
+    harness = harness_for(backend)
+    ctx = SpawnContext(
+        agent="kirocrew",
+        work_dir=tmp_path / "workspace",
+        model="auto",
+        environ=parent_env,
+        home=tmp_path / "home",
+    )
+    with (
+        patch.object(
+            client_mod, "_resolve_codex_acp_bin", return_value=(_CODEX_ACP_ARGV, _SEARCH_PATH)
+        ),
+        patch.object(
+            codex_harness_mod, "resolve_spawn_masks", new=AsyncMock(return_value=((), ()))
+        ),
+        patch.object(codex_harness_mod, "_sandbox_wrapper_generations", return_value=0),
+    ):
+        plan = asyncio.run(harness.resolve_spawn(ctx))
+    env = dict(parent_env)
+    harness.apply_spawn_env(env)
+    added = {
+        key: VOLATILE_ENV.get(key, value)
+        for key, value in sorted(env.items())
+        if parent_env.get(key) != value
+    }
+    removed = sorted(key for key in parent_env if key not in env)
+    return {
+        "argv": list(plan.argv),
+        "served_by": "AcpRuntime",
+        "rss_depth": plan.rss_depth,
+        "env_added": added,
+        "env_removed": removed,
+    }
+
+
+def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
+    """Drive the launch for *backend* and return its answers.
+
+    A runtime-only host is captured from its harness (see
+    :func:`_capture_runtime_served`); every other id is driven through ``_spawn``.
     ``tmp_path`` is the work dir the client is built against; nothing is written
     inside the repository.
     """
+    if backend in RUNTIME_ONLY_BACKENDS:
+        return _capture_runtime_served(backend, tmp_path, fixed_parent_env())
     rec = _Recorder()
     # The parent the delta is measured against, and the one the spawn actually runs
     # under: both are this fixed environment, so ``env_added`` is what _spawn
