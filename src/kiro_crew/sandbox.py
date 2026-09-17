@@ -405,6 +405,17 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # additionally mask Global V1 through the trusted private_memory spawn flag;
     # no environment variable can opt out of that member-only boundary.
     "memory_stores",
+    # Portable Project registry (``project_registry.py``, leaf
+    # ``PROJECT_REGISTRY_DIR_NAME``): the install-local registry of pinned Git
+    # remotes/branches and registrations, plus its lock. HIDDEN rather than
+    # read-only for the same reason ``memory_stores`` is -- the value of the
+    # fence is that a spawned shell inside a Project session cannot READ the
+    # authority its session was resolved from, so a read-only tree would
+    # preserve exactly that exposure. Nothing inside the sandbox opens it: the
+    # registry reader runs in the gateway. Materialized checkouts live under the
+    # separate, visible ``projects/`` leaf -- the agent works in them and they
+    # are never a source of authority.
+    "projects-registry",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",

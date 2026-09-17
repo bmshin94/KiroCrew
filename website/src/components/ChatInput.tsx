@@ -595,6 +595,10 @@ interface ChatInputProps {
   onFileSelect?: (path: string, kind?: FileKind, token?: string) => void
   onFileOpen?: (path: string) => void
   project?: string
+  /** Display name of the Project attached to this session. When set, the
+   * Project is the session identity; its workspace repo and branch stay
+   * implementation details rather than appearing in the composer. */
+  projectBundleName?: string
   /** Checked-out branch of the active project (or short SHA when detached). */
   projectBranch?: string
   /** True when the project's HEAD is detached, so the label is a commit. */
@@ -937,6 +941,7 @@ function ChatInput({
   onFileSelect,
   onFileOpen,
   project,
+  projectBundleName,
   projectBranch,
   projectDetached,
   projectGitDirty,
@@ -1440,13 +1445,16 @@ function ChatInput({
   // previously discoverable is lost, and names the branch even when the label
   // is truncated or the shelf has collapsed to icon-only.
   const projectChipTitle = useMemo(() => {
+    if (projectBundleName) {
+      return i18nT('components.chatInput.project_bundle_locked', { name: projectBundleName })
+    }
     if (!project) return i18nT('components.chatInput.select_project')
     const base = i18nT('components.chatInput.project_2', { path: project })
     if (!projectBranch) return base
     return projectDetached
       ? `${base}\n${i18nT('components.chatInput.detached_head_at', { branch: projectBranch })}`
       : `${base}\n${i18nT('components.chatInput.branch', { branch: projectBranch })}`
-  }, [project, projectBranch, projectDetached])
+  }, [project, projectBundleName, projectBranch, projectDetached])
   // Tooltip for the working-tree badge. Reuses the Git panel's catalog entry
   // so the badge adds no i18n keys; the arrow segments are glyph+number only
   // (script-neutral, plain concatenation — a template literal here reads as an
@@ -4856,8 +4864,8 @@ function ChatInput({
           <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
           <button
             className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-            onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
-            disabled={isRunning}
+            onClick={projectBundleName ? undefined : e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
+            disabled={isRunning || Boolean(projectBundleName)}
             title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
             aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
           >
@@ -4867,9 +4875,9 @@ function ChatInput({
                 the ambiguity this label exists to remove. The enclosing shelf
                 group is flex-1/min-w-0, so both segments still shrink below
                 these caps on a narrow window. */}
-            {!shelfCompact && <span className="truncate max-w-[160px]">{project ? (project.split('/').filter(Boolean).pop() || project) : i18nT('components.chatInput.project')}</span>}
+            {!shelfCompact && <span className="truncate max-w-[160px]">{projectBundleName || (project ? (project.split('/').filter(Boolean).pop() || project) : i18nT('components.chatInput.project'))}</span>}
           </button>
-          {!shelfCompact && !!projectBranch && (
+          {!projectBundleName && !shelfCompact && !!projectBranch && (
             <>
               <span className="opacity-40 shrink-0" aria-hidden="true">·</span>
               {/* Copying stays enabled while a response is running — unlike
