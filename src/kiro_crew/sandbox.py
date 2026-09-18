@@ -5340,6 +5340,7 @@ sys.path[:] = [p for p in sys.path if p not in ("", sys.path[0])]
 import ctypes
 import json
 import os
+import signal
 import stat
 import tempfile
 
@@ -5505,6 +5506,52 @@ SSH_KNOWN_HOSTS = {ssh_known_hosts}
 HIDE_SSH = {hide_ssh}
 SANDBOX_LEVEL = {sandbox_level_json}
 
+def _namespace_record_directory():
+    """Pin the protected directory; never follow a replaced path component."""
+    home = {str(config_dir().resolve())!r}
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    try:
+        for component in home.strip("/").split("/"):
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        for component in (None, "member-memory-bindings", "pids"):
+            if component is not None:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            info = os.fstat(fd)
+            if info.st_uid != REAL_UID or info.st_mode & 0o022:
+                raise PermissionError("unsafe namespace record directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def _retire_namespace_record(directory, name, owned_fd):
+    """Remove only our still-pinned regular inode, without reopening its path."""
+    if name is None or owned_fd is None:
+        return
+    try:
+        expected = os.fstat(owned_fd)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (stat.S_ISREG(current.st_mode) and current.st_uid == REAL_UID
+                and current.st_nlink == 1
+                and (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)):
+            # This publisher is still alive, so its PID cannot be reused by
+            # another launcher between the check and unlink. No sweep may use
+            # this argument for a dead publisher, even with an advisory lock.
+            os.unlink(name, dir_fd=directory)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        sys.stderr.write("sandbox: WARNING -- namespace record retirement failed\\n")
+
 def main():
     argv = sys.argv[1:]
     if not argv:
@@ -5528,39 +5575,82 @@ def main():
         # ── Parent: write identity UID/GID map ──
         os.close(c2p_w)
         os.close(p2c_r)
-        os.read(c2p_r, 1)  # wait for child to unshare(NEWUSER)
-        with open(f"/proc/{{pid}}/setgroups", "w") as f:
-            f.write("deny")
-        with open(f"/proc/{{pid}}/uid_map", "w") as f:
-            f.write(f"{{REAL_UID}} {{REAL_UID}} 1\\n")
-        with open(f"/proc/{{pid}}/gid_map", "w") as f:
-            f.write(f"{{REAL_GID}} {{REAL_GID}} 1\\n")
-        os.write(p2c_w, b"x")  # signal child to proceed
-        # The bound PID is this unsandboxed launcher, not its child. Publish
-        # the child's real namespace pair from the trusted side of the fence
-        # before allowing it to run. A nested private view cannot forge this.
-        if os.read(c2p_r, 1) != b"n":
-            sys.exit("sandbox: FATAL - child did not publish its namespace readiness")
-        os.close(c2p_r)
-        _namespace_dir = {str(config_dir().resolve() / "member-memory-bindings" / "pids")!r}
-        os.makedirs(_namespace_dir, mode=0o700, exist_ok=True)
-        _namespaces = []
-        for _kind in ("user", "mnt"):
-            _info = os.stat(f"/proc/{{pid}}/ns/{{_kind}}")
-            _namespaces.append([_info.st_dev, _info.st_ino])
-        with open("/proc/self/stat") as _handle:
-            _stat = _handle.read()
-        _start = _stat[_stat.rfind(")") + 2:].split()[19]
-        _fd, _temporary = tempfile.mkstemp(dir=_namespace_dir, suffix=".tmp")
-        with os.fdopen(_fd, "w") as _handle:
-            json.dump({{"process_start": _start, "namespaces": _namespaces,
-                       "private_memory": {private_memory!r}}}, _handle)
-        os.replace(_temporary, os.path.join(_namespace_dir, f"{{os.getpid()}}.namespace.json"))
-        os.write(p2c_w, b"n")
-        os.close(p2c_w)
-        _, status = os.waitpid(pid, 0)
-        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
-        sys.exit(code)
+        _directory = _owned_fd = _temporary = _published = None
+        _shutdown_signal = None
+        _waiting = False
+
+        def _request_shutdown(signum, frame):
+            nonlocal _shutdown_signal, _waiting
+            _shutdown_signal = signum
+            if _waiting:
+                _waiting = False
+                raise SystemExit(128 + signum)
+
+        def _parent_wait(operation, *args):
+            # Only interrupt pipe/wait calls, never inode acquisition,
+            # publication or retirement. The inner finally disarms raising
+            # before the outer finally, including on repeated signals.
+            nonlocal _waiting
+            try:
+                _waiting = True
+                if _shutdown_signal is not None:
+                    raise SystemExit(128 + _shutdown_signal)
+                return operation(*args)
+            finally:
+                _waiting = False
+
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+        try:
+            _parent_wait(os.read, c2p_r, 1)  # wait for child to unshare(NEWUSER)
+            with open(f"/proc/{{pid}}/setgroups", "w") as f:
+                f.write("deny")
+            with open(f"/proc/{{pid}}/uid_map", "w") as f:
+                f.write(f"{{REAL_UID}} {{REAL_UID}} 1\\n")
+            with open(f"/proc/{{pid}}/gid_map", "w") as f:
+                f.write(f"{{REAL_GID}} {{REAL_GID}} 1\\n")
+            _parent_wait(os.write, p2c_w, b"x")  # signal child to proceed
+            # Publish from the trusted parent before releasing the child.
+            if _parent_wait(os.read, c2p_r, 1) != b"n":
+                sys.exit("sandbox: FATAL - child did not publish its namespace readiness")
+            _directory = _namespace_record_directory()
+            _namespaces = []
+            for _kind in ("user", "mnt"):
+                _info = os.stat(f"/proc/{{pid}}/ns/{{_kind}}")
+                _namespaces.append([_info.st_dev, _info.st_ino])
+            with open("/proc/self/stat") as _handle:
+                _stat = _handle.read()
+            _start = _stat[_stat.rfind(")") + 2:].split()[19]
+            _target = f"{{os.getpid()}}.namespace.json"
+            try:
+                _existing = os.stat(_target, dir_fd=_directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if (not stat.S_ISREG(_existing.st_mode) or _existing.st_uid != REAL_UID
+                        or _existing.st_nlink != 1):
+                    raise PermissionError("unsafe namespace record target")
+            # mkstemp has no dir_fd parameter. procfs reaches the pinned
+            # directory, not a path that can redirect after validation.
+            _owned_fd, _path = tempfile.mkstemp(dir=f"/proc/self/fd/{{_directory}}", suffix=".tmp")
+            _temporary = os.path.basename(_path)
+            with os.fdopen(os.dup(_owned_fd), "w") as _handle:
+                json.dump({{"process_start": _start, "namespaces": _namespaces,
+                           "private_memory": {private_memory!r}}}, _handle)
+            os.replace(_temporary, _target, src_dir_fd=_directory, dst_dir_fd=_directory)
+            _published = _target
+            _parent_wait(os.write, p2c_w, b"n")
+            _, status = _parent_wait(os.waitpid, pid, 0)
+            code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+            sys.exit(code)
+        finally:
+            # Keep the inode open until retirement so inode reuse cannot
+            # mistake a replacement for ours. SIGKILL cannot run this block.
+            _retire_namespace_record(_directory, _published, _owned_fd)
+            _retire_namespace_record(_directory, _temporary, _owned_fd)
+            for _close_fd in (_owned_fd, _directory, c2p_r, p2c_w):
+                if _close_fd is not None:
+                    os.close(_close_fd)
     else:
         # ── Child: unshare, wait for maps, mount, exec ──
         os.close(c2p_r)

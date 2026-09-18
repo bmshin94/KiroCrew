@@ -84,6 +84,44 @@ Pure V1 installations retain the existing internal contract. Pooled MCP
 refuses a missing/mismatched caller before forwarding when the originating
 process has a protected private identity.
 
+Linux namespace publication has a launcher-owned lifetime. The unsandboxed
+parent keeps its staging inode open, publishes before releasing the child, and
+retires only that inode after child completion (including nonzero exit), or while
+unwinding setup, serialization, publication, pipe or wait failures. Cleanup uses
+a pinned directory descriptor and no-follow inode checks; linked directory
+components, foreign owners, writable protected directories and non-regular or
+hardlinked targets are refused. A replaced record is retained. No per-PID lock
+file is created, and the companion session binding is not removed.
+
+Only the generated parent installs SIGTERM/SIGINT handlers, after fork. Signals
+interrupt pipe handshakes and child waits with exit status `128 + signal`.
+During inode acquisition, publication and cleanup they are recorded instead of
+raising: cancellation is checked before releasing the child, and repeated
+signals cannot interrupt retirement. A signal during cleanup does not replace
+an already collected child exit status. Child signal handling and the caller's
+existing process-group termination remain unchanged.
+
+Retirement is best-effort: filesystem refusal, SIGKILL, interpreter crash or host
+failure can leave records or staging files. The periodic artifact maintenance
+executor does **not** sweep these names. Legacy launchers do not participate in
+a publication lock, and a dead-PID check plus inode recheck cannot prevent PID
+reuse and a legacy publication between the last check and unlink. Age alone
+never licenses removal: even an old V1 namespace record can still authenticate
+a live runtime. Random legacy staging files also lack reliable publisher
+identity, so an online scan cannot safely distinguish an abandoned file from an
+in-flight publication. Existing backlog is deliberately retained, not bounded
+or reported as recovered by this lifecycle fix.
+
+Reclaiming that backlog requires operator-established quiescence for **all**
+launchers sharing the data home, including pre-upgrade processes, with new
+launches excluded for the entire cleanup. A future offline cleanup can then
+validate the protected path and remove only the namespace-file family; generic
+staging names require separate provenance review. An online recovery protocol
+instead needs a coordinated publisher migration before enabling deletion.
+Neither is inferred from gateway restart, file age or a new advisory lock.
+The namespace reader's live incarnation, exact namespace-pair and strictly
+non-private checks remain unchanged; missing records grant no authority.
+
 The local-secret owner-token mint endpoint also checks kernel identity when
 private members exist. A private process, corrupt binding or unverifiable peer
 receives `403 member_owner_token_refused`; an actual unowned host app/CLI can
