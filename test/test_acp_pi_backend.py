@@ -26,6 +26,7 @@ import ast
 import asyncio
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import re
 import shutil
 import subprocess
 import textwrap
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,7 @@ import pytest
 from kiro_crew.acp import client as acp_client
 from kiro_crew.acp._dispatch import GATE_ENVELOPE_MARKER, build_permission_event, gate_envelope
 from kiro_crew.acp.client import (
+    _READBACK_STDERR_EXCERPT_CHARS,
     PI_ACP_BIN,
     PI_BIN,
     PI_GATE_EXTENSION_SHA256,
@@ -51,6 +54,7 @@ from kiro_crew.acp.client import (
     _ensure_pi_gate_launcher,
     _pi_commands_from_readback,
     _pi_gate_launcher_body,
+    _readback_stderr_excerpt,
     _resolve_pi_acp_bin,
     _resolve_pi_bin,
     _seal_pi_gate_extension,
@@ -713,6 +717,295 @@ class TestTheReadBackComparesFilesNotStrings:
         assert "_same_file_spelling(extension_path)" in source
 
 
+#: A 40-char run of the base64 alphabet: the AWS secret-access-key shape the
+#: redactors' bare-secret detector is built for. Not a real key.
+_AWS_SECRET_SHAPE = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+class TestTheReadBackStderrExcerpt:
+    """The excerpt travels into an operator-facing refusal, so it is bounded."""
+
+    def test_nothing_to_report_is_the_empty_string(self):
+        for empty in ("", "   ", "\n\t\r", None, 7):
+            assert _readback_stderr_excerpt(empty) == ""
+
+    def test_the_tail_is_kept_because_the_failure_is_written_last(self):
+        """A harness prints its banner first and fails last."""
+        banner = "pi 0.85.1 starting up. " * 200
+        stderr = banner + "/bin/sh: pi: Permission denied"
+        excerpt = _readback_stderr_excerpt(stderr)
+        assert "Permission denied" in excerpt
+        assert excerpt.startswith("...")
+
+    def test_the_excerpt_is_bounded(self):
+        excerpt = _readback_stderr_excerpt("x" * 50_000)
+        assert len(excerpt) <= _READBACK_STDERR_EXCERPT_CHARS + len("...")
+
+    def test_a_huge_stderr_is_windowed_before_any_normalization(self):
+        """Each spelling is a full-size copy, so an unbounded capture multiplies it.
+
+        Pins the window rather than the copies: nothing here sees more than
+        ``_READBACK_STDERR_SCAN_CHARS`` characters, whatever the child wrote.
+        """
+        seen: list[int] = []
+        real = acp_client._flatten_child_output
+
+        def _record(text: str, control: str) -> str:
+            seen.append(len(text))
+            return real(text, control)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(acp_client, "_flatten_child_output", _record)
+            _readback_stderr_excerpt("y" * 5_000_000)
+        assert seen, "the flattener was never reached"
+        assert max(seen) <= acp_client._READBACK_STDERR_SCAN_CHARS
+
+    def test_a_secret_in_the_published_tail_still_suppresses_it(self):
+        """The window is the tail, so what is published is always what is scanned."""
+        noise = "banner line. " * 500
+        assert _readback_stderr_excerpt(noise + f"key={_AWS_SECRET_SHAPE}") == ""
+
+    def test_control_characters_never_reach_a_terminal_or_a_log(self):
+        """A raw escape sequence in a refusal can rewrite what an operator sees."""
+        excerpt = _readback_stderr_excerpt(
+            "\x1b[2J\x1b[1;31mred\x1b[0m\r\nsecond line\x00\x07 done"
+        )
+        assert excerpt == "[2J [1;31mred [0m second line done"
+        assert not any(unicodedata.category(ch).startswith("C") for ch in excerpt)
+
+    def test_a_short_message_is_passed_through_whole(self):
+        assert (
+            _readback_stderr_excerpt("/bin/sh: /Users/me/.local/bin/pi: Permission denied\n")
+            == "/bin/sh: /Users/me/.local/bin/pi: Permission denied"
+        )
+
+    def test_a_secret_suppresses_the_whole_excerpt(self):
+        """Fail closed: no diagnosis beats a credential in an operator-facing string."""
+        assert _readback_stderr_excerpt(f"auth failed for key={_AWS_SECRET_SHAPE}") == ""
+
+    def test_a_secret_split_by_a_separator_also_suppresses_it(self):
+        """The bare-secret patterns need a contiguous run, so a split hides one.
+
+        A wrap newline or a NUL dropped into a 40-char key leaves two fragments
+        neither pattern matches, and publishing them with a space inserted
+        publishes every character of the key. Both spellings are checked, so the
+        joined one sees it and the excerpt is withheld.
+
+        The separator families are covered together because they fail for two
+        different reasons: category C and Z characters are split points that
+        ``str.split()`` would turn into one space in BOTH spellings, while the
+        zero-width ones do not split a token at all yet still break the run.
+        """
+        separators = {
+            "LF (Cc)": "\n",
+            "CR (Cc)": "\r",
+            "NUL (Cc)": "\x00",
+            "ESC (Cc)": "\x1b",
+            "TAB (Cc)": "\t",
+            "VT (Cc)": "\v",
+            "LINE SEPARATOR (Zl)": "\u2028",
+            "PARAGRAPH SEPARATOR (Zp)": "\u2029",
+            "NO-BREAK SPACE (Zs)": "\xa0",
+            "OGHAM SPACE MARK (Zs)": "\u1680",
+            "IDEOGRAPHIC SPACE (Zs)": "\u3000",
+            "ZERO WIDTH SPACE (Cf)": "\u200b",
+            "WORD JOINER (Cf)": "\u2060",
+            "SOFT HYPHEN (Cf)": "\xad",
+            "plain space (Zs)": " ",
+        }
+        for label, sep in separators.items():
+            split = _AWS_SECRET_SHAPE[:18] + sep + _AWS_SECRET_SHAPE[18:]
+            excerpt = _readback_stderr_excerpt(f"error: key={split} rejected")
+            assert excerpt == "", f"{label} leaked: {excerpt!r}"
+            assert _AWS_SECRET_SHAPE[:18] not in excerpt
+
+    def test_every_separator_the_splitter_breaks_on_is_classified(self):
+        """The removal set must not drift from ``str.split()``'s own predicate.
+
+        Scanned over the whole BMP rather than a hand-listed sample: a character
+        ``split()`` breaks on that this function does not rewrite is a split point
+        present in both spellings, which is exactly the shape that published a
+        secret whole.
+        """
+        missed = [
+            hex(cp)
+            for cp in range(0x110000)
+            if chr(cp).isspace() and not acp_client._is_child_output_separator(chr(cp))
+        ]
+        assert missed == []
+
+    def test_a_secret_split_by_any_mid_token_byte_suppresses_it(self):
+        """The general class: ANY byte inside the run hides it from the redactors.
+
+        A separator is only the easiest instance. An ANSI sequence contributes ESC
+        (a separator) plus trailing ``[31m`` bytes that are not separators at all,
+        and a lone ``-`` or ``.`` is not one either, yet each breaks the contiguous
+        ``[A-Za-z0-9+/]`` run the bare-secret patterns need. The third spelling
+        strips a token to the credential alphabet, so it rejoins the run whatever
+        split it.
+        """
+        insertions = {
+            "ANSI CSI colour": "\x1b[31m",
+            "ANSI reset": "\x1b[0m",
+            "ANSI OSC title": "\x1b]0;t\x07",
+            "hyphen": "-",
+            "dot": ".",
+            "underscore": "_",
+            "colon": ":",
+            "bracket": "[",
+            "pipe": "|",
+            "combining acute": "\u0301",
+        }
+        for label, mid in insertions.items():
+            split = _AWS_SECRET_SHAPE[:18] + mid + _AWS_SECRET_SHAPE[18:]
+            excerpt = _readback_stderr_excerpt(f"error: key={split} rejected")
+            assert excerpt == "", f"{label} leaked: {excerpt!r}"
+            assert _AWS_SECRET_SHAPE[:18] not in excerpt
+
+    def test_no_credential_is_recoverable_under_any_split(self):
+        """The claim the docstring makes, pinned so prose cannot drift from code.
+
+        Sweeps every pair of split offsets against four separator pairs, over three
+        credential shapes that exercise different redactor rules: a bare 40-char run,
+        a prefixed 20-char access-key id, and a prefixed labelled token. "Not
+        recoverable" is checked after deleting non-alphanumerics from the published
+        text, because an excerpt a reader can de-mangle by eye is a leak.
+        """
+        creds = (
+            ("AWS_ACCESS_KEY_ID=", "AKIAIOSFODNN7EXAMPLE"),
+            ("key=", _AWS_SECRET_SHAPE),
+            ("SLACK_BOT_TOKEN=", "-".join(("xoxb", "1234", "5678", "AbCdEfGhIjKlMnOpQrSt"))),
+        )
+        junk = re.compile(r"[^A-Za-z0-9]")
+        leaks = []
+        for label, secret in creds:
+            for i, j in itertools.combinations(range(1, len(secret)), 2):
+                for first, second in ((".", "\n"), ("-", " "), (".", " "), ("_", "\n")):
+                    body = secret[:i] + first + secret[i:j] + second + secret[j:]
+                    out = _readback_stderr_excerpt(f"config error: {label}{body} rejected")
+                    if out and (secret in out or secret in junk.sub("", out)):
+                        leaks.append((label, i, j, first, second))
+        assert leaks == [], f"recoverable credential in {len(leaks)} split(s), e.g. {leaks[:3]}"
+
+    def test_no_ansi_sequence_form_leaks_at_any_offset(self):
+        """ANSI colouring is ordinary terminal output, so every form is swept.
+
+        Swept against PREFIXED credentials as well as the bare run, because the two
+        fail for different reasons: a bare run needs its contiguous alphabet
+        restored, while a prefixed one needs a delimiter (``glpat-``, ``ghp_``,
+        ``xoxb-``) that a rejoining removes. Each shape is asserted to be one the
+        redactors actually recognise, so a sweep cannot pass merely because nothing
+        was ever detectable.
+        """
+        forms = (
+            "\x1b[31m",
+            "\x1b[0m",
+            "\x1b[1;32m",
+            "\x1b[",
+            "\x1b[2K",
+            "\x1b]0;x\x07",
+            "\x1b[38;5;208m",
+        )
+        secrets = (
+            _AWS_SECRET_SHAPE,
+            "AKIAIOSFODNN7EXAMPLE",
+            "glpat" + "-" + "AbCdEfGhIjKlMnOpQrSt",
+            "ghp" + "_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            "-".join(("xoxb", "1234", "5678", "AbCdEfGhIjKlMnOpQrSt")),
+        )
+        junk = re.compile(r"[^A-Za-z0-9]")
+        leaks = []
+        for secret in secrets:
+            assert (
+                _readback_stderr_excerpt(f"error: key={secret} rejected") == ""
+            ), f"{secret[:8]}... is not a shape the redactors know, so the sweep proves nothing"
+            for form in forms:
+                for cut in range(1, len(secret)):
+                    split = secret[:cut] + form + secret[cut:]
+                    out = _readback_stderr_excerpt(f"error: key={split} rejected")
+                    if out and (secret in out or secret in junk.sub("", out)):
+                        leaks.append((secret[:8], form, cut))
+        assert leaks == [], f"ANSI leak in {len(leaks)} case(s), e.g. {leaks[:3]}"
+
+    def test_a_secret_split_by_mixed_separator_classes_suppresses_it(self):
+        """One break in whitespace and another in punctuation defeats both narrow probes.
+
+        Deleting separators keeps the punctuation; stripping a token to the alphabet
+        never crosses the whitespace. The whole-string rejoin is what collapses a run
+        broken both ways.
+        """
+        mixed = {
+            "dot + newline": (".", "\n"),
+            "hyphen + space": ("-", " "),
+            "ANSI + newline": ("\x1b[31m", "\n"),
+            "colon + tab": (":", "\t"),
+            "zero-width + dot": ("\u200b", "."),
+            "combining + U+2028": ("\u0301", "\u2028"),
+        }
+        for label, (first, second) in mixed.items():
+            split = (
+                _AWS_SECRET_SHAPE[:12]
+                + first
+                + _AWS_SECRET_SHAPE[12:26]
+                + second
+                + _AWS_SECRET_SHAPE[26:]
+            )
+            excerpt = _readback_stderr_excerpt(f"error: key={split} rejected")
+            assert excerpt == "", f"{label} leaked: {excerpt!r}"
+            assert _AWS_SECRET_SHAPE[:12] not in excerpt
+
+    def test_a_labelled_credential_is_suppressed_intact_and_wrapped(self):
+        """The labelled patterns matter too, not only the bare 40-char run.
+
+        The fixtures are ASSEMBLED at runtime rather than written as literals. A
+        realistic token shape spelled out in the file is what GitHub's push
+        protection scans for, and it blocks the push whether or not the value is
+        real -- correctly, since a file cannot say "this one is fake". Joining the
+        parts keeps the runtime value the redactors must see while leaving no
+        matching literal on disk.
+        """
+        labelled = (
+            "SLACK_BOT_TOKEN=" + "-".join(("xoxb", "1234", "5678", "AbCdEfGhIjKlMnOpQrSt")),
+            "Authorization: Bearer " + "abcDEF123456ghiJKL789mnoPQR012stuVWX345yz",
+            "token=" + "ghp" + "_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+        )
+        for raw in labelled:
+            cut = len(raw) // 2
+            for variant in (raw, raw[:cut] + "\n" + raw[cut:]):
+                assert _readback_stderr_excerpt(f"config error: {variant}") == "", variant
+
+    def test_a_long_path_token_is_not_mistaken_for_a_secret(self):
+        """The token probe must not suppress the diagnostic it exists to protect.
+
+        A realistic launcher path is one long token, and stripping it to the
+        credential alphabet leaves a 70-character run -- longer than the 40-char
+        floor. The redactors' entropy and shape gates are what keep it clean, and
+        this pins that, because a probe that flagged it would withhold exactly the
+        message an operator needs to tell one exec failure from another.
+        """
+        line = (
+            "/bin/sh: /Users/me/.local/lib/node_modules/@earendil-works/"
+            "pi-coding-agent/dist/cli.js: Permission denied"
+        )
+        assert _readback_stderr_excerpt(line) == line
+
+    def test_a_secret_split_at_every_offset_suppresses_it(self):
+        """No offset inside the run is a hole, including the first and last."""
+        for cut in range(1, len(_AWS_SECRET_SHAPE)):
+            split = _AWS_SECRET_SHAPE[:cut] + "\n" + _AWS_SECRET_SHAPE[cut:]
+            assert _readback_stderr_excerpt(f"key={split}") == "", f"leaked at cut {cut}"
+
+    def test_an_ordinary_failure_is_not_suppressed_by_the_secret_check(self):
+        """The check must not swallow the message this exists to deliver."""
+        for line in (
+            "/bin/sh: /Users/me/.local/bin/pi: Permission denied",
+            "/bin/sh: /Users/me/.local/bin/pi: bad interpreter: No such file or directory",
+            "pi: unknown flag --extension",
+            "env: node: No such file or directory",
+        ):
+            assert _readback_stderr_excerpt(line) == line
+
+
 class TestTheReadBackReportsFailureRatherThanAssuming:
     """A read-back that could not run must never read as "loaded"."""
 
@@ -733,10 +1026,69 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 3
             stdout = ""
+            stderr = ""
 
         monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
         issue, remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
         assert "exit 3" in issue and "get_commands" in remedy
+
+    def test_the_childs_own_reason_reaches_the_refusal(self, tmp_path, monkeypatch):
+        """An exit code alone names a verdict, not a cause.
+
+        The launcher is /bin/sh exec'ing the resolved harness binary, so the shell's
+        own sentence is what tells an exec the OS refused apart from a shebang it
+        cannot resolve. The refusal carries it.
+        """
+
+        class _Completed:
+            returncode = 126
+            stdout = ""
+            stderr = "/bin/sh: /Users/me/.local/bin/pi: Permission denied\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert "exit 126" in issue
+        assert "Permission denied" in issue
+
+    def test_a_silent_child_is_reported_as_the_bare_exit(self, tmp_path, monkeypatch):
+        """No placeholder: "the child said nothing" must not look like "Crew hid it"."""
+
+        class _Completed:
+            returncode = 126
+            stdout = ""
+            stderr = "   \n\t\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert issue.endswith("(exit 126)")
+
+    def test_a_response_that_never_came_still_reports_the_childs_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """A zero exit with no parseable answer is the other half of the same path."""
+
+        class _Completed:
+            returncode = 0
+            stdout = "not json at all"
+            stderr = "pi: unknown flag --extension\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert "no response" in issue
+        assert "unknown flag" in issue
+
+    def test_a_secret_in_the_childs_stderr_is_not_republished(self, tmp_path, monkeypatch):
+        """A refusal reaches the dashboard and the chat card; the child is foreign."""
+
+        class _Completed:
+            returncode = 126
+            stdout = ""
+            stderr = f"config error: key={_AWS_SECRET_SHAPE} rejected\n"
+
+        monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
+        issue, _remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
+        assert _AWS_SECRET_SHAPE not in issue
+        assert issue.endswith("(exit 126)"), "a secret withholds the excerpt, not just the secret"
 
     def test_a_registry_without_the_gate_is_refused_with_the_gate_remedy(
         self, tmp_path, monkeypatch
@@ -744,6 +1096,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry(("compact", None)))
+            stderr = ""
 
         monkeypatch.setattr(acp_client.subprocess_mod, "run", lambda *_a, **_kw: _Completed())
         issue, remedy = self._client(tmp_path)._verify_pi_gate(self.ARGV, self.EXT)
@@ -756,6 +1109,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry((PROBE, self.EXT)))
+            stderr = ""
 
         def _fake_run(argv, **kwargs):
             seen["argv"] = argv
@@ -780,6 +1134,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry((PROBE, self.EXT)))
+            stderr = ""
 
         def _fake_run(argv, **kwargs):
             seen["env"] = kwargs["env"]
@@ -803,6 +1158,7 @@ class TestTheReadBackReportsFailureRatherThanAssuming:
         class _Completed:
             returncode = 0
             stdout = _response(_registry((PROBE, self.EXT)))
+            stderr = ""
 
         def _fake_run(argv, **kwargs):
             seen["env"] = kwargs["env"]
