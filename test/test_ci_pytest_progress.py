@@ -305,7 +305,8 @@ class TestCIProgress(unittest.TestCase):
             "--timeout=180",
             "--no-cov",
             "--max-worker-restart=0",
-            '--splits "$SHARD_COUNT"',
+            '--file-shards "$SHARD_COUNT"',
+            "-p scripts.ci_file_shards",
         ]:
             self.assertIn(flag, command)
         self.assertIn("-p scripts.ci_pytest_progress", command)
