@@ -327,6 +327,13 @@ def _probe_pi() -> BackendInstallState:
     )
 
 
+#: Backend id -> its probe. A probe that answers by calling :func:`probe_backend`
+#: for ANOTHER backend must also add itself to :data:`_PROBE_READS`, or a re-probe of
+#: it will rebuild the entry it just dropped from the upstream verdict still cached.
+#: ``_probe_kas`` is the only one today. Nothing can detect the delegation
+#: automatically -- it is a call inside a function body -- so this note is the
+#: forcing function, and ``test_every_delegate_names_a_real_probe`` at least keeps the
+#: table from naming an id that does not exist.
 _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
     ACP_BACKEND_KIRO: _probe_kiro,
     ACP_BACKEND_KAS: _probe_kas,
@@ -343,6 +350,54 @@ _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
         for backend in sorted(ACP_BACKENDS_SELF_SERVED_ACP)
     },
 }
+
+
+#: Which OTHER backend's cached verdict a probe reads, for the probes that delegate.
+#:
+#: ``_probe_kas`` answers by calling :func:`probe_backend` for kiro, so a re-probe of
+#: KAS that dropped only the KAS entry would rebuild it from kiro's still-cached one
+#: and report the same verdict it was asked to re-take. Declared here beside the
+#: probes rather than known by the caller: the delegation is this module's design,
+#: and a caller that had to know it would be a second place that can forget.
+_PROBE_READS: Dict[str, str] = {ACP_BACKEND_KAS: ACP_BACKEND_KIRO}
+
+
+def forget_probe(backend: str) -> None:
+    """Drop *backend*'s cached verdict, and any verdict its probe reads.
+
+    Narrower than :func:`clear_probe_cache` on purpose. Re-checking one harness
+    must not make the panel's next poll re-resolve all eight, and the Claude and
+    self-served probes each shell out or walk the filesystem, so a wholesale clear
+    would turn one button into that much work.
+    """
+    with _cache_lock:
+        _cache.pop(backend, None)
+        delegate = _PROBE_READS.get(backend)
+        if delegate is not None:
+            _cache.pop(delegate, None)
+
+
+def forget_for_recheck(backend: str) -> None:
+    """Drop BOTH caches that can make a fresh install read as unusable.
+
+    This module's TTL verdict, and the running gateway's own resolve result that
+    ``restart_required`` is derived from. Together they are what stands between an
+    operator who just ran the install command and a working switch.
+
+    **Non-blocking, and it must be called ON THE EVENT LOOP.** It resolves nothing --
+    it only drops what is remembered -- so there is no reason to offload it, and one
+    strong reason not to: :func:`drivers.acp.forget_cached_resolution` is only
+    thread-safe on the loop, because every reader on the spawn path is loop-resident
+    code with no ``await`` between its check and its read. Its docstring has the
+    evidence.
+
+    Deliberately NOT paired with the probe in one function. An earlier shape did
+    exactly that, and bundling them is what pushed the clear into the worker thread
+    the probe needs -- so the pairing was the defect, not a convenience. The caller
+    clears here, then offloads :func:`probe_backend`.
+    """
+    acp_driver.forget_cached_resolution(backend)
+    forget_probe(backend)
 
 
 def _policy_id(backend: str) -> str:
@@ -430,6 +485,8 @@ __all__ = [
     "UNKNOWN",
     "BackendInstallState",
     "clear_probe_cache",
+    "forget_probe",
     "probe_backend",
     "probe_backends",
+    "forget_for_recheck",
 ]
