@@ -70,7 +70,7 @@ concurrency:
 jobs:
   add:
     name: Add contributors to README
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.repository != 'kirodotdev/KiroCrew' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) }}
     timeout-minutes: 10
     steps:
       # Check out the default branch. github.event.repository is absent on

@@ -67,6 +67,18 @@ jobs:
   # holds nothing worth reaching.
   generate:
     name: Security scope candidates (Fable 5)
+    # Deliberately NOT routed to the CodeBuild fleet, unlike the rest of this
+    # PR's migration. The write fence two steps below hardcodes
+    # `Write(//home/runner/work/_actions/**)` -- the GitHub-hosted runner's
+    # action-code path -- to stop the untrusted-diff-driven model step from
+    # overwriting an action that runs later in this job with its live Bedrock
+    # OIDC credentials. CodeBuild relocates that directory (its actions land
+    # under `/codebuild/output/<random>/...`), so the same absolute-path deny
+    # would silently stop matching there and the fence would fail OPEN instead
+    # of closed -- exactly the failure mode the comment at the fence's
+    # definition already names as a known weakness of a hardcoded path. Revisit
+    # once the fence itself is CodeBuild-portable (an expression, not a literal
+    # path) rather than routing this job before that lands.
     runs-on: ubuntu-latest
     # OIDC for Bedrock, and read-only on the PR: this stage proposes candidates and
     # posts nothing.
@@ -648,7 +660,7 @@ jobs:
       always()
       && needs.generate.outputs.in_scope == 'true'
       && needs.generate.outputs.override != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.repository != 'kirodotdev/KiroCrew' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) }}
     # `contents: read` and NOTHING else. This job can execute the pull request's own
     # harness, so it must hold nothing worth reaching: no `id-token`, so no AWS
     # assume is even possible here, and no scope that could post or patch this
@@ -1255,7 +1267,7 @@ jobs:
     # always(): a leg that reds is exactly the run whose verdict must be
     # published, and the exit-3 short circuit skips `adjudicate` entirely.
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.repository != 'kirodotdev/KiroCrew' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) }}
     # Posts, and holds the ONLY write scope in this lane. On a `pull_request`
     # event a bare checkout resolves to the PR MERGE REF, so the workspace below
     # IS the change under review -- which makes `scripts/` a path the change can

@@ -66,7 +66,7 @@ env:
 jobs:
   metrics:
     name: Deterministic metrics
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.repository != 'kirodotdev/KiroCrew' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) }}
     # Sized for the worst observed week (57 min) twice over: SZZ cost scales
     # with fix volume and `window_days` is a dispatch input.
     timeout-minutes: 120
@@ -149,7 +149,7 @@ jobs:
   analyze:
     name: Classify and narrate
     needs: metrics
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.repository != 'kirodotdev/KiroCrew' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) }}
     # The model half alone. 09-07 was cut off two minutes into it because the
     # metrics half had spent 57 of the shared 60.
     timeout-minutes: 40
