@@ -36,6 +36,7 @@ from kiro_crew.providers.base import (
     LLMEvent,
     LLMProvider,
 )
+from kiro_crew.sandbox import SandboxCeilingUnsealable
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -328,11 +329,31 @@ async def _chat(message: str | None, model: str | None, agent: str | None = None
 
 
 def _run_chat(message: str | None, model: str | None, agent: str | None = None) -> None:
-    """Run chat at the sync CLI boundary and render SIGINT as a clean exit."""
+    """Run chat at the sync CLI boundary and render SIGINT as a clean exit.
+
+    Also renders a fail-closed SANDBOX REFUSAL as a message rather than a traceback.
+    ``sandbox.wrap_argv`` raises ``SandboxCeilingUnsealable`` when a governance ceiling
+    cannot be made sealable — a symlink or a second hard link on the live-target pointer
+    is the shape an ordinary snapshot tool produces — and that refusal is deliberately
+    NOT in the ``AcpError`` hierarchy, so ``_stream_and_print``'s handler never sees it
+    and it escaped here as an unhandled exception. The remedy was technically on screen,
+    buried under a stack trace that reads as a Kiro Crew crash, which is the wrong thing
+    to tell an operator whose actual problem is one extra file link.
+
+    Printed verbatim: the exception's own text names the path and the one-step fix, and a
+    summary here would be a second wording of it that could drift.
+    """
     try:
         asyncio.run(_chat(message, model, agent=agent))
     except KeyboardInterrupt:
         print("\nBye! 👻")
+    except SandboxCeilingUnsealable as exc:
+        print(f"\n❌ {exc}", file=sys.stderr)
+        print(
+            "   Run `kirocrew doctor` to see this before the next spawn.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _can_prompt(interactive: bool) -> bool:

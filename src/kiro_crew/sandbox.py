@@ -1577,12 +1577,20 @@ def _materialize_live_target_mask_target() -> str | None:
     if not os.path.isdir(root):
         return None
     target = os.path.join(root, _LIVE_TARGET_LEAF)
-    _refuse_if_dangling_symlink(target)
-    # A RESOLVING link is the attack entry, not just a dangling one: a mount follows its
-    # target, so the mask would bind over the referent while the lexical name stayed an
+    # ANY symlink refuses, dangling or resolving, and in ONE sentence. A resolving link
+    # is the attack entry rather than just a dangling one: a mount follows its target, so
+    # the mask would bind over the referent while the lexical name stayed an
     # agent-replaceable link in a writable directory. Refused before the isfile check,
     # exactly as the directory materialiser refuses before its isdir check.
-    _refuse_if_symlink_leaf(target)
+    #
+    # This refuses a SUPERSET of what the two generic helpers
+    # (``_refuse_if_dangling_symlink`` then ``_refuse_if_symlink_leaf``) refused between
+    # them, so nothing is admitted that they rejected. The pointer gets its own for two
+    # reasons: those helpers say "the masked DIRECTORY <path> is a SYMLINK", which names
+    # the wrong kind of thing for a JSON document an operator is about to go look at; and
+    # the sentence is shared with ``live_target_pointer_unfitness`` so doctor's
+    # pre-spawn warning and this refusal cannot come to describe one file two ways.
+    _refuse_if_live_target_symlink(target)
     if os.path.exists(target):
         _refuse_unless_sole_regular_link(target)
         return None
@@ -1625,6 +1633,102 @@ def _materialize_live_target_mask_target() -> str | None:
     )
 
 
+def _refuse_if_live_target_symlink(target: str) -> None:
+    """Refuse the spawn when the live-target pointer's path is a symlink of any kind.
+
+    One check for both link shapes, because both fail the same way: a mask binds over the
+    path a link RESOLVES to, so the link's own name stays a writable entry in the data
+    home and a sandboxed process can replace it with a pin of its own. A dangling link is
+    the same hole with the referent missing.
+
+    Deliberately NOT the shared ``_refuse_if_symlink_leaf``: its sentence names "the
+    masked directory", and this target is a JSON document. It also has to be the sentence
+    :func:`live_target_pointer_unfitness` reports, so the pre-spawn warning and the
+    refusal stay one string.
+
+    Refused rather than removed: ``lstat`` then ``unlink`` is not atomic, so removing it
+    here would race whoever put it there.
+    """
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot stat the live-target pointer {target} to check for a symlink: {exc}"
+        ) from exc
+    if not stat.S_ISLNK(info.st_mode):
+        return
+    points_at = "(unreadable)"
+    with contextlib.suppress(OSError):
+        points_at = os.readlink(target)
+    raise SandboxCeilingUnsealable(_live_target_symlink_detail(target, points_at))
+
+
+#: Classification of a live-target pointer that no spawn can mask, as reported by
+#: :func:`live_target_pointer_unfitness`. The values are the STABLE names a surface
+#: branches on; the operator-facing sentence is the record's ``detail``, so a reader
+#: never has to match on prose to know which shape it found.
+LIVE_TARGET_UNFIT_IRREGULAR: str = "irregular"
+LIVE_TARGET_UNFIT_MULTILINK: str = "multilink"
+LIVE_TARGET_UNFIT_SYMLINK: str = "symlink"
+
+
+class LiveTargetUnfitness(NamedTuple):
+    """Why the live-target pointer cannot be masked, and what fixes it.
+
+    ``kind`` is one of the ``LIVE_TARGET_UNFIT_*`` names, ``path`` is the pointer, and
+    ``detail`` is the SAME sentence :class:`SandboxCeilingUnsealable` carries for that
+    shape — see :func:`live_target_pointer_unfitness` for why the two must be one string.
+    """
+
+    kind: str
+    path: str
+    detail: str
+
+
+def _live_target_irregular_detail(target: str) -> str:
+    """The refusal sentence for a non-regular file at the pointer's path."""
+    return (
+        f"cannot mask {target}: a non-regular file (a link, FIFO, socket, or device "
+        "node) is sitting at the live-target pointer's path. The launcher's "
+        "isdir/isfile loops classify neither, so its mask would be silently "
+        "skipped for every sandbox. Remove or replace it with a regular file."
+    )
+
+
+def _live_target_multilink_detail(target: str, links: int) -> str:
+    """The refusal sentence for a pointer reachable under more than one name.
+
+    Names the ``find`` invocation rather than only the condition: a hard link is left by
+    ordinary operation (``cp -al``, rsnapshot, a dotfile manager), so the operator who
+    meets this has no reason to know which OTHER path shares the inode, and without the
+    command the remedy "remove the extra link" names no file to remove.
+    """
+    return (
+        f"cannot mask {target}: the live-target pointer has {links} hard links, "
+        "so a mask over this name would leave another path to the same bytes "
+        "unmasked. List every name for these bytes with "
+        f"'find {os.path.dirname(target)} -samefile {target}', remove the extra "
+        "link(s), and restart."
+    )
+
+
+def _live_target_symlink_detail(target: str, points_at: str) -> str:
+    """The refusal sentence for a symlink squatting the pointer's path.
+
+    Wording of its own rather than the shared directory-leaf refusal's: that helper is
+    reached for real directories too and says "the masked directory", which for
+    ``live_target.json`` names the wrong kind of thing to an operator reading it.
+    """
+    return (
+        f"cannot mask {target}: the live-target pointer is a SYMLINK -> {points_at}. "
+        "A mask binds over the link's target, not the name, so the name stays "
+        "replaceable in a writable directory and a sandboxed process could point it "
+        "at a checkout it controls. Replace it with a regular file, and restart."
+    )
+
+
 def _refuse_unless_sole_regular_link(target: str) -> None:
     """Raise unless *target* is a regular file with exactly one hard link.
 
@@ -1635,23 +1739,79 @@ def _refuse_unless_sole_regular_link(target: str) -> None:
     — whether planted by a same-uid process in a namespace that could see a staging
     temp, or left by an operator's ``ln``. ``FileNotFoundError`` propagates so a
     publish-race caller can tell "gone" from "unfit".
+
+    The sentences come from the module-level formatters so ``kirocrew doctor`` can report
+    the same condition, in the same words, BEFORE a spawn refuses on it.
     """
     st = os.lstat(target)
     if not stat.S_ISREG(st.st_mode):
-        raise SandboxCeilingUnsealable(
-            f"cannot mask {target}: a non-regular file (a link, FIFO, socket, or device "
-            "node) is sitting at the live-target pointer's path. The launcher's "
-            "isdir/isfile loops classify neither, so its mask would be silently "
-            "skipped for every sandbox. Remove or replace it with a regular file."
+        raise SandboxCeilingUnsealable(_live_target_irregular_detail(target))
+    if st.st_nlink != 1:
+        raise SandboxCeilingUnsealable(_live_target_multilink_detail(target, st.st_nlink))
+
+
+def live_target_pointer_unfitness() -> LiveTargetUnfitness | None:
+    """Classify the LIVE live-target pointer the way a spawn would, WITHOUT spawning.
+
+    ``None`` means nothing to report: a healthy pointer, an absent one (the materialiser
+    publishes a stub for it), or no data home yet. Anything else is a shape that makes
+    :func:`_materialize_live_target_mask_target` refuse, so it refuses EVERY Linux agent
+    spawn on the host until an operator fixes it.
+
+    It exists because the refusal is the operator's only notice today, and it arrives too
+    late and in the wrong place: a hard link on a config file is ordinary operation for a
+    snapshot tool (``cp -al``, rsnapshot) and for a dotfile manager, so the condition
+    appears without anybody doing anything wrong, and the first symptom is that agents
+    stop starting. ``kirocrew doctor`` is where an operator looks for that, and this is
+    the read that lets it answer.
+
+    Shares the refusal's own sentences rather than paraphrasing them, so the pre-spawn
+    warning and the post-refusal error cannot drift into describing the same file two
+    different ways — and so a reworded remedy reaches both surfaces at once.
+
+    Read-only and total: it never creates, moves or removes anything, and a data home it
+    cannot stat is reported as nothing rather than as a fault, because doctor must not
+    turn its own probe failure into a verdict about the host.
+    """
+    try:
+        root = str(config_dir())
+    except Exception:  # pragma: no cover - defensive; doctor must survive a bad home
+        logger.debug("could not resolve the crew data home for live-target fitness")
+        return None
+    if not os.path.isdir(root):
+        return None
+    target = os.path.join(root, _LIVE_TARGET_LEAF)
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        # Absent is FIT: the materialiser publishes the absent-equivalent stub, which
+        # is the whole reason that function exists.
+        return None
+    except OSError:
+        logger.debug("could not stat the live-target pointer %s", target, exc_info=True)
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        points_at = "(unreadable)"
+        with contextlib.suppress(OSError):
+            points_at = os.readlink(target)
+        return LiveTargetUnfitness(
+            kind=LIVE_TARGET_UNFIT_SYMLINK,
+            path=target,
+            detail=_live_target_symlink_detail(target, points_at),
+        )
+    if not stat.S_ISREG(st.st_mode):
+        return LiveTargetUnfitness(
+            kind=LIVE_TARGET_UNFIT_IRREGULAR,
+            path=target,
+            detail=_live_target_irregular_detail(target),
         )
     if st.st_nlink != 1:
-        raise SandboxCeilingUnsealable(
-            f"cannot mask {target}: the live-target pointer has {st.st_nlink} hard links, "
-            "so a mask over this name would leave another path to the same bytes "
-            "unmasked. List every name for these bytes with "
-            f"'find {os.path.dirname(target)} -samefile {target}', remove the extra "
-            "link(s), and restart."
+        return LiveTargetUnfitness(
+            kind=LIVE_TARGET_UNFIT_MULTILINK,
+            path=target,
+            detail=_live_target_multilink_detail(target, st.st_nlink),
         )
+    return None
 
 
 def _md_notebook_degraded_mask_dirs() -> list[str]:
